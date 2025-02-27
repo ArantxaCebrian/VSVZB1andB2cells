@@ -1,0 +1,133 @@
+---
+title: 'Pre-processing steps'
+output: html_notebook
+author: 'Marcos Nascimento and Arantxa Cebrian-Silla' 
+---
+
+```{r setup}
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+
+options(future.globals.maxSize = 16 * 1024^3)  # Example: 16 GB
+
+source("../my_functions.R") #Loading a couple of custom functions for plotting
+```
+
+## Integrating
+```{r}
+counts <- ReadMtx(mtx      = 'data/geo/matrix.mtx',
+                  cells    = 'data/geo/barcodes.txt',
+                  features = 'data/geo/features.txt',
+                  feature.column = 1,
+                  mtx.transpose = F)
+
+meta <- read_csv('data/geo/metadata.csv')
+
+integrated_exp <- CreateSeuratObject(counts, meta.data = meta)
+
+integrated_exp[["RNA"]] <- split(integrated_exp[["RNA"]], f = integrated_exp$batch)
+
+integrated_exp <- integrated_exp %>% 
+  SCTransform() %>% 
+  RunPCA(npcs = 100) %>% 
+  RunUMAP(dims = 1:100, 
+          reduction = 'pca',
+          reduction.name = 'nonint') %>% 
+  IntegrateLayers(method = CCAIntegration, 
+                  normalization.method = 'SCT') %>% 
+  RunUMAP(dims = 1:100, 
+          reduction = 'integrated.dr') %>% 
+  FindNeighbors(dims = 1:100, 
+                reduction = 'integrated.dr') %>%
+  FindClusters(resolution = seq(0.5, 2, 0.5))
+```
+
+```{r}
+(mDimPlot(integrated_exp, group.by = 'batch', shuffle = T) + 
+  labs(title = 'Integrated UMAP')) +
+(mDimPlot(integrated_exp, group.by = 'batch', shuffle = T, reduction = 'nonint') + 
+  labs(title = 'Non-integrated UMAP'))
+
+(mDimPlot(integrated_exp, group.by = 'age', shuffle = T) + 
+  labs(title = 'Integrated UMAP')) +
+(mDimPlot(integrated_exp, group.by = 'age', shuffle = T, reduction = 'nonint') + 
+  labs(title = 'Non-integrated UMAP'))
+```
+
+
+```{r}
+mDimPlot(integrated_exp, shuffle = T, group.by = 'cell_type_batch1', label = T)
+mDimPlot(integrated_exp, shuffle = T, group.by = c('batch', 'region', 'age'), ncol = 3) 
+
+mFeaturePlot(integrated_exp, features = c('Thbs4', 'Adamts18', 'Hgf', 'Igsf21', 'Notum', 'Bmper', 'Crym', 'Npy'), order = F, ncol = 4, legend = F) 
+mFeaturePlot(integrated_exp, features = c('S100a6', 'S100b', 'Egfr', 'Top2a', 'Dcx', 'Foxj1'), order = F, legend = F, ncol = 3)
+```
+
+```{r}
+mDimPlot(integrated_exp, group.by = 'SCT_snn_res.2', label = T, legend = F)
+```
+
+## Cell type annotation
+```{r}
+Idents(integrated_exp) = 'SCT_snn_res.2'
+
+integrated_exp@meta.data <- integrated_exp@meta.data %>%
+  mutate(cell_type = case_when(
+    SCT_snn_res.2 %in% c(33, 11, 0, 43, 35) ~ 'Ependymal cells',
+    SCT_snn_res.2 %in% c(22, 28) ~ 'Astrocytes',
+    SCT_snn_res.2 %in% c(16, 8, 18, 26, 20) ~ 'B cells',
+    SCT_snn_res.2 == 10 ~ 'C cells',
+    SCT_snn_res.2 %in% c(12, 9, 17, 24) ~ 'Dividing cells',
+    SCT_snn_res.2 %in% c(29, 15, 4, 46, 23, 14, 1, 30, 21, 7, 5, 6) ~ 'A cells',
+    SCT_snn_res.2 == 44 ~ 'VLMC',
+    SCT_snn_res.2 %in% c(13, 45, 19) ~ 'OPC',
+    SCT_snn_res.2 %in% c(36, 32) ~ 'Oligodendrocytes',
+    SCT_snn_res.2 %in% c(31, 3, 42) ~ 'Microglia',
+    SCT_snn_res.2 == 37 ~ 'Myeloid cells',
+    SCT_snn_res.2 %in% c(2, 41, 27) ~ 'Endothelial cells',
+    SCT_snn_res.2 %in% c(25, 40) ~ 'Pericytes/VSMC',
+    SCT_snn_res.2 %in% c(38, 39, 34) ~ 'Neurons',
+    TRUE ~ 'Unknown'
+  ))
+
+
+DimPlot(integrated_exp, 
+        group.by = 'cell_type', 
+        label=T, 
+        cols = c('indianred2','plum3','steelblue3', 'seagreen3', 'gold','pink', 'sandybrown','hotpink', 'grey','brown3','brown', 'maroon3','magenta4','coral','pink')) +
+  NoLegend() + 
+  coord_fixed() + 
+  NoAxes()
+
+
+DimPlot(integrated_exp, 
+        group.by = 'cell_type', 
+        label=F, 
+        cols = c('indianred2','grey','steelblue3', 'seagreen3', 'gold','grey', 'grey','grey', 'grey','grey','grey', 'grey','grey','grey','grey')) +
+  NoLegend() + 
+  coord_fixed() + 
+  NoAxes()
+
+DimPlot(integrated_exp, 
+        group.by = 'cell_type', 
+        label=FALSE, 
+        cols = c('grey', 'grey','steelblue3', 'grey', 'grey', 'grey','grey','grey', 'grey','grey', 'grey', 'grey', 'grey', 'grey')) + 
+  NoLegend() + 
+  coord_fixed() + 
+  NoAxes()
+```
+
+```{r}
+#Exporting the data
+count_matrix <- JoinLayers(integrated_exp[['RNA']])['counts']
+cells <- colnames(count_matrix)
+features <- rownames(count_matrix)
+metadata <- integrated_exp@meta.data
+
+write(cells, 'data/geo/barcodes.txt')
+write(features, 'data/geo/features.txt')
+writeMM(count_matrix, "data/geo/matrix.mtx")
+write_csv(metadata, 'data/geo/metadata.csv')
+```
+
