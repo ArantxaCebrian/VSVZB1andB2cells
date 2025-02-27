@@ -5,8 +5,11 @@ Raw data: The newly generated scRNA-seq data from V-SVZ containing apically-labe
 
 
 The code is organized in separate notebooks for each step of the analysis:
+
 -Preprocess
+
 -B1 and B2 cells analysis
+
 -Label transfer
 
 
