@@ -1,0 +1,667 @@
+---
+title: "B2 cells Analysis"
+output: html_notebook
+author: "Marcos Nascimento and Arantxa Cebrian-Silla" 
+---
+
+#Setup
+```{r setup}
+library(Seurat)
+library(tidyverse)
+library(scales)
+library(viridis)
+library(patchwork)
+library(ggrepel)
+
+
+
+#set working directory to the location of the file
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+source("../my_functions.R") #Loading a couple of custom functions for plotting
+```
+
+```{r}
+integrated_exp <- readRDS("../pre-processing/integrated_exp_withp365.rds")
+```
+
+```{r}
+mDimPlot(integrated_exp, group.by = "cell_type", label = T, shuffle = T, legend = F, repel = T)
+```
+
+# -Subset B clusters
+```{r}
+b_cells <- integrated_exp@meta.data %>% filter(cell_type == 'B cells') %>% rownames()
+```
+
+```{r}
+Head <- subset(integrated_exp, cells = b_cells)
+```
+
+```{r}
+Head <- Head %>% 
+        SCTransform() %>% 
+        RunPCA(assay = "SCT", npcs = 100) %>% 
+        IntegrateLayers(method               = CCAIntegration, 
+                        normalization.method = "SCT", 
+                        verbose              = F) %>% 
+        RunUMAP(dims = 1:100, reduction = "integrated.dr") %>% 
+        FindNeighbors(reduction = "integrated.dr", dims = 1:100) %>% 
+        FindClusters(resolution = seq(0.5, 2, 0.5), graph.name = "SCT_snn")
+
+mDimPlot(Head, label=T, shuffle = T, group.by ="SCT_snn_res.1", legend = F)
+```
+## Rotating the UMAP coordinates 
+```{r}
+umap_original <- Head@reductions$umap@cell.embeddings
+
+# Rotate all points by 45 degrees
+umap_rotated <- rotate_points(umap_original, 180)
+colnames(umap_rotated) <- c("umap_1", "umap_2")
+Head@reductions$umap@cell.embeddings <- umap_rotated
+
+mDimPlot(Head, label=T, shuffle = T, group.by ="SCT_snn_res.0.5", legend = F)
+``` 
+
+## Assigning regions
+```{r}
+Head@meta.data <- Head@meta.data %>%
+  mutate(bcell_subtype = case_when(
+    SCT_snn_res.1 %in% c(10, 1, 7) ~ "aB cells",
+    SCT_snn_res.1 %in% c(3, 5, 8) ~ "Ventral Subpallial B cells",
+    SCT_snn_res.1 %in% c(0, 6) ~ "Dorsal Pallial B cells",
+    SCT_snn_res.1 %in% c(4, 2, 9) ~ "Dorsal Subpallial B cells",
+    TRUE ~ "Unknown"
+  ))
+
+Head@meta.data <- Head@meta.data %>%
+  mutate(activation_state = case_when(
+    bcell_subtype == "aB cells" ~ "activated",
+    TRUE ~ "quiescent"
+  ))
+
+mDimPlot(Head, 
+        group.by = "bcell_subtype", 
+        label = F, 
+        cols = c("cyan","blue","dodgerblue2","dodgerblue4", "dodgerblue3")) 
+
+mDimPlot(Head, group.by = "region", label = F, shuffle = F, cols = c("grey80", "purple", "forestgreen")) 
+``` 
+
+#- B1 / B2 identification
+### Identifying  Tdtomato+ (Wpre+) cells 
+
+```{r}
+#Assuming that B1 and B2 cells co-exist in similar numbers at P30, and only 25% of B1 cells are infected, we should select the top 12.5% Wpre-expressing cells in each batch.
+wpre.data = Head@meta.data %>% 
+  mutate(wpre_expression = Head@assays$SCT@data["Wpre",] %>% 
+         as.data.frame() %>% 
+         pull("."))
+
+batch2_thres <- wpre.data %>% 
+  filter(batch == "batch_2" & 
+         region == 'LW' & 
+         age == 'p30') %>% 
+  pull(wpre_expression) %>% 
+  quantile(probs = 0.875)
+
+batch3_thres <- wpre.data  %>% 
+  filter(batch == "batch_3" & 
+         region == 'LW' & 
+         age == 'p30') %>% 
+  pull(wpre_expression) %>% 
+  quantile(probs = 0.875)
+
+
+batch2_thres 
+batch3_thres 
+```
+
+```{r}
+VlnPlot(Head, "Wpre", group.by = "batch", split.by = "region") + geom_hline(yintercept = c(batch2_thres, batch3_thres, 2.1)) #There is one cell with Wpre > 2 in the Wedge region. This cell could be a contaminant or a B1 cell that transitioned to B2 between injection and cell dissociation.
+
+VlnPlot(Head, "Wpre", group.by = "age", split.by = "region") + geom_hline(yintercept = c(batch2_thres, batch3_thres, 2.1)) #There is one cell with Wpre > 2 in the Wedge region. This cell could be a contaminant or a B1 cell that transitioned to B2 between injection and cell dissociation.
+``` 
+
+
+```{r}
+#Selecting Wpre+ cells, defined as cells with high Wpre expression, excluding cells coming from the Wedge region
+wpre.data <- wpre.data %>% 
+  mutate(wpre_label = case_when(age != 'p30' | batch == 'batch_1' ~ NA,
+                                batch == "batch_2" & 
+                                age == 'p30' &
+                                wpre_expression >= batch2_thres & 
+                                region!= "Wedge" & 
+                                bcell_subtype != "Dorsal Pallial B cells" ~
+                                  "wpre+",
+                                 
+                                  
+                                batch == "batch_3" &
+                                age == 'p30' &
+                                  wpre_expression >= batch3_thres &
+                                region != "Wedge" &
+                                bcell_subtype != "Dorsal Pallial B cells" ~ 
+                                  "wpre+",
+                                .default = "wpre-"))
+
+#Calculating the number of unlabeled B1 cells in the dataset:
+wpre.data %>% 
+  filter(region != "Wedge"
+         ) %>% 
+  group_by(batch, wpre_label) %>% 
+  summarise(n = n()) %>% 
+  left_join(wpre.data %>% 
+              filter(region != "Wedge") %>% 
+              group_by(batch) %>% 
+              summarize(batch_n = n()), by = "batch") %>%
+  mutate(pct = n/batch_n)
+```
+### Identifying non-infected B1 cells
+```{r}
+#Assuming that these cells are the most similar to Wpre+ cells.
+#Splitting our dataset into different batches, selecting only cells that are not in the Wedge region.
+wpre_cells_batch2 <- wpre.data %>% 
+                      filter(wpre_label == "wpre+" &
+                             batch == "batch_2") %>% 
+                      rownames()
+
+wpre_cells_batch3 <- wpre.data %>% 
+                      filter(wpre_label == "wpre+" &
+                             batch == "batch_3") %>% 
+                      rownames()
+```
+
+```{r}
+batch2_lw_cells <- Head@meta.data %>% filter(region == "LW" &
+                                                batch == "batch_2") %>% rownames()
+batch3_lw_cells <- Head@meta.data %>% filter(region == "LW" &
+                                                batch == "batch_3") %>% rownames()
+
+Head_batch2 <- Head %>% subset(cells = batch2_lw_cells) %>%
+  SCTransform() %>% 
+  RunPCA(assay = "SCT", 
+         npcs = 100) %>% 
+  FindNeighbors(dims = 1:10,
+                k.param = 30,
+                return.neighbor = T)
+
+Head_batch3 <- Head %>% subset(cells = batch3_lw_cells) %>%
+  SCTransform() %>% 
+  RunPCA(assay = "SCT", 
+         npcs = 100) %>% 
+  FindNeighbors(dims = 1:10, 
+                k.param = 30,
+                return.neighbor = T)
+```
+
+```{r}
+#Inferring unlabeled b1 cells in batch 2:
+wpre_index_batch2 <- which(Head_batch2@neighbors$SCT.nn@cell.names %in% wpre_cells_batch2)
+
+good.neighbors_batch2 <- c()
+bad.neighbors <- wpre_index_batch2 #Excluding labeled cells from the list of neighbors
+
+for (i in wpre_index_batch2) {
+  all.neighbors <- Head_batch2@neighbors$SCT.nn@nn.idx[i,2:30]
+  good.neighbors_batch2 <- c(good.neighbors_batch2, 
+                             (all.neighbors[!all.neighbors %in% bad.neighbors])[1:3])
+  bad.neighbors <- c(bad.neighbors, good.neighbors_batch2) %>% unique()
+}
+
+wpre_neighbors_batch2 <- Head_batch2@neighbors$SCT.nn@cell.names[good.neighbors_batch2]
+wpre_neighbors_batch2 <- wpre_neighbors_batch2[!is.na(wpre_neighbors_batch2)]
+
+#Inferring unlabeled b1 cells in batch 3:
+wpre_index_batch3 <- which(Head_batch3@neighbors$SCT.nn@cell.names %in% wpre_cells_batch3)
+
+good.neighbors_batch3 <- c()
+bad.neighbors <- wpre_index_batch3
+
+for (i in wpre_index_batch3) {
+  all.neighbors <- Head_batch3@neighbors$SCT.nn@nn.idx[i,2:30]
+  good.neighbors_batch3 <- c(good.neighbors_batch3, (setdiff(all.neighbors, bad.neighbors))[1:3])
+  bad.neighbors <- c(bad.neighbors, good.neighbors_batch3)
+}
+
+wpre_neighbors_batch3 <- Head_batch3@neighbors$SCT.nn@cell.names[good.neighbors_batch3]
+wpre_neighbors_batch3 <- wpre_neighbors_batch3[!is.na(wpre_neighbors_batch3)]
+```
+
+```{r}
+wpre.data[, "tdtom"] <- "TdTomato-"
+wpre.data[c(wpre_neighbors_batch2, wpre_neighbors_batch3),"tdtom"] <- "TdTomato+ NN"
+wpre.data[c(wpre_cells_batch2, wpre_cells_batch3), "tdtom"] <- "TdTomato+"
+
+wpre.data %>% 
+  filter(region != "Wedge") %>% 
+  group_by(batch, tdtom) %>% 
+  summarise(n = n()) %>% 
+  left_join(wpre.data %>% 
+              filter(region != "Wedge") %>% 
+              group_by(batch) %>% 
+              summarize(batch_n = n()), by = "batch") %>%
+  mutate(pct = n/batch_n)
+
+```
+
+```{r}
+wpre.data %>% 
+  filter(region != "Wedge" & batch == 'batch_2') %>% 
+  group_by(age, tdtom) %>% 
+  summarise(n = n()) %>% 
+  left_join(wpre.data %>% 
+              filter(region != "Wedge" & batch == 'batch_2') %>% 
+              group_by(age) %>% 
+              summarize(age_n = n(), by = "age")) %>%
+  mutate(pct = n/age_n)
+```
+
+
+
+```{r}
+Head$tdtom <- wpre.data$tdtom
+
+Head@meta.data %>% 
+  rownames_to_column('bc') %>% 
+  left_join(wpre.data %>% rownames_to_column('bc') %>% select(bc, tdtom), by = 'bc') %>% 
+column_to_rownames('bc')
+
+Head@meta.data[, "b_type"] <- "b2"
+Head@meta.data[c(wpre_cells_batch2, wpre_cells_batch3, wpre_neighbors_batch2, wpre_neighbors_batch3),"b_type"] <- "b1"
+
+mDimPlot(Head, group.by = "b_type", shuffle = T) 
+mDimPlot(Head, group.by = "b_type", split.by = "age") 
+```
+
+### Label transfer to uninfected batch
+```{r}
+Head@active.assay = "RNA"
+
+non_infected_features <- rownames(Head)[!rownames(Head) %in% c('Wpre', 'GFP', 'Cre')]
+
+Head_batch1 <- subset(Head, subset = batch == "batch_1", features = non_infected_features) %>%
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA(assay = "RNA",
+         npcs = 20) %>%
+  FindNeighbors(dims = 1:20)
+
+
+Head_batch23 <- subset(Head, subset = batch %in% c("batch_2", "batch_3"))
+Head_batch23 <- Head_batch23 %>%
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA(assay = "RNA",
+         npcs = 20)
+Head_batch23 <- IntegrateLayers(Head_batch23, method = CCAIntegration, orig.reduction = "pca", dims = 1:20)
+
+Head.anchors <- Head_batch23 %>%
+  FindTransferAnchors(reference = .,
+                      query = Head_batch1,
+                      dims = 1:20,
+                      reference.reduction = "integrated.dr")
+
+predictions <- TransferData(anchorset = Head.anchors, refdata = Head_batch23$b_type, dims = 1:20)
+
+inferredb1_batch1_cells <- predictions %>% filter(predicted.id != "b2") %>% rownames()
+Head@meta.data[inferredb1_batch1_cells, "tdtom"] <- "TdTomato+ LT"
+Head@meta.data[inferredb1_batch1_cells, "b_type"] <- "b1"
+
+#---------------------------------
+
+# Head@active.assay = "RNA"
+# non_infected_features <- rownames(Head)[!rownames(Head) %in% c('Wpre', 'GFP', 'Cre')]
+# 
+# Head_batch1 <- Head %>% 
+#   subset(subset = batch == "batch_1", features = non_infected_features) %>% 
+#   NormalizeData() %>%
+#   FindVariableFeatures() %>%
+#   ScaleData() %>% 
+#   RunPCA(assay = "RNA", 
+#          npcs = 20) %>% 
+#   FindNeighbors(dims = 1:20)
+# 
+# 
+# Head_batch23 <- Head %>% subset(subset = batch != "batch_1", features = non_infected_features)
+# Head_batch23 <- JoinLayers(Head_batch23, assay = "RNA")
+# Head_batch23[["RNA"]] <- split(Head_batch23[["RNA"]], f = Head_batch23$batch)
+# 
+# Head_batch23 <- Head_batch23 %>% 
+#   NormalizeData() %>%
+#   FindVariableFeatures() %>%
+#   ScaleData() %>% 
+#   RunPCA(assay = "RNA", 
+#          npcs = 20)
+# Head_batch23 <- IntegrateLayers(Head_batch23, method = CCAIntegration, orig.reduction = "pca", dims = 1:20)
+# 
+# Head.anchors <- Head_batch23 %>% 
+#   FindTransferAnchors(reference = ., 
+#                       query = Head_batch1, 
+#                       dims = 1:20,
+#                       reference.reduction = "pca")
+# 
+# predictions <- TransferData(anchorset = Head.anchors, 
+#                             refdata = Head_batch23$b_type, 
+#                             dims = 1:20)
+# 
+# predictions %>% filter(predicted.id =='b1')
+# 
+# inferredb1_batch1_cells <- predictions %>% filter(predicted.id == "b1") %>% rownames()
+# Head@meta.data[inferredb1_batch1_cells, "tdtom"] <- "TdTomato+ LT"
+# Head@meta.data[inferredb1_batch1_cells, "b_type"] <- "b1"
+```
+
+
+```{r}
+Head@active.assay <- 'SCT'
+
+mFeaturePlot(Head, features = c("S100a6", "Egfr", "Crym", "Urah", "Tfap2c"), order = T, ncol = 5, legend = F) 
+
+mDimPlot(Head, group.by = "age",  order = T) + 
+  scale_color_manual(values = c('grey90', 'tomato'))
+
+mDimPlot(Head, group.by = "activation_state", split.by = "age", shuffle = T) + 
+  scale_color_manual(values = c('#1c9099', '#a6bddb'), name = 'Activation State') 
+
+mFeaturePlot(Head, features = c("Crym", "Egfr"), split.by = "age",  order = T) 
+
+mDimPlot(Head, group.by = "b_type",  shuffle = T) + 
+  scale_color_manual(values = c("b1" = "skyblue1", "b2" = "mediumblue"), labels = c('B1', 'B2'))
+
+mDimPlot(Head, group.by = "b_type", split.by = "age", shuffle = T) + 
+  scale_color_manual(values = c("b1" = "skyblue1", "b2" = "mediumblue"), labels = c('B1', 'B2'))
+
+mDimPlot(Head, group.by = "tdtom", order = T) + 
+  scale_color_manual(values = c("TdTomato+" = "magenta", 
+                                "TdTomato+ NN" = "darkorange", 
+                                "TdTomato+ LT" = 'darkgreen'),
+                     na.value = 'grey90')
+
+mDimPlot(Head, group.by = "tdtom", split.by = 'tdtom', order = T) + 
+  scale_color_manual(values = c("TdTomato+" = "magenta", 
+                                "TdTomato+ NN" = "darkorange", 
+                                "TdTomato+ LT" = 'darkgreen'),
+                     na.value = 'grey90')
+``` 
+
+```{r}
+mDimPlot(Head, group.by = "SCT_snn_res.1",  shuffle = T, label = T, legend = F)
+mDimPlot(Head, group.by = "SCT_snn_res.1",  split.by = 'region', shuffle = T, label = T, legend = F)
+``` 
+
+```{r}
+Head@meta.data %>% 
+  ggplot(aes(x = age, fill = b_type)) +
+  geom_bar(position = 'fill') +
+  theme_classic() + 
+  scale_fill_manual(values = c("b1" = "skyblue1", "b2" = "mediumblue"), labels = c('B1', 'B2')) +
+  scale_y_continuous(labels = scales::percent, expand = c(0,0)) +
+  labs(x = "Age", y = "Fraction of cells", fill = "B cell type") 
+ggsave('../figures/b1b2_barplot.pdf', width = 5, height = 3)
+```
+
+
+# -Activation/Quiescence
+##  in B1 and B2 cells
+```{r}
+a <- Head@meta.data %>% 
+  filter(region == 'LW' & age == 'p30') %>% 
+  ggplot(aes(x = b_type, fill = activation_state)) +
+  geom_bar() +
+  theme_classic() + 
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_x_discrete(labels = c('B1', 'B2')) + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_fill_manual(values = c('#1c9099', '#a6bddb'), name = 'Activation State') +
+  labs(x = NULL, y = 'Count')
+
+b <- Head@meta.data %>% 
+  filter(region == 'LW' & age == 'p30') %>% 
+  ggplot(aes(x = b_type, fill = activation_state)) +
+  geom_bar(position = 'fill') +
+  theme_classic() + 
+  scale_y_continuous(expand = c(0, 0), labels = scales::percent) +
+  scale_x_discrete(labels = c('B1', 'B2')) +  
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_fill_manual(values = c('#1c9099', '#a6bddb'), name = 'Activation State') +
+  labs(x = NULL, y = 'Share')
+
+a + b + plot_layout(guides = 'collect') + plot_annotation(caption = 'Only cells in the LW region at p30 are shown.')
+```
+
+## in p30 and p365
+```{r}
+c <- Head@meta.data %>% 
+  filter(region == 'LW') %>% 
+  ggplot(aes(x = age, fill = activation_state)) +
+  geom_bar(position = 'fill') +
+  theme_classic() + 
+  scale_y_continuous(expand = c(0, 0), labels = scales::percent) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_fill_manual(values = c('#1c9099', '#a6bddb'), name = 'Activation State') +
+  labs(x = NULL, y = 'Share')
+
+b + c + plot_layout(guides = 'collect', axis_titles = 'collect_y') + plot_annotation(caption = 'Only cells in the LW region are shown.')
+ggsave("../figures/activation_states.pdf", width = 5, height = 3)
+```
+
+
+#- DEGs
+```{r}
+Idents(Head) <- "b_type"
+
+HeadQ <- Head %>% subset(subset = activation_state == 'quiescent') %>% 
+  SCTransform(return.only.var.genes = F) %>% 
+  PrepSCTFindMarkers()
+
+btype_markers <- FindAllMarkers(HeadQ, 
+                                logfc.threshold = 0, 
+                                min.pct = 0, 
+                                only.pos = T)
+
+btype_markers <- btype_markers %>%
+  group_by(cluster) %>%
+  mutate(rank = rank(p_val_adj, ties.method = "first")) %>%
+  arrange(cluster, rank)
+```
+
+
+#- Volcano Plot
+```{r}
+validated.genes = c("Atf3", "Ptprz1", "Riiad1", "FoxJ1", "Gadd45b", "Zeb1", "Tagln2", "Emp1", "Anxa2")
+regional.genes = c("Crym", "Nrg1", "Klf2", "Cebpd", "Gm29260", "Pax6", "Rlbp1", "Nkx6-2")
+b1_degenes = btype_markers %>% filter(cluster == "b1") %>% rownames()
+b2_degenes = btype_markers %>% filter(cluster == "b2") %>% rownames()
+genes_to_highlight = c(b1_degenes[1:5], b2_degenes[1:5],validated.genes, regional.genes)
+
+volcano.data = btype_markers %>% 
+                mutate(labs = if_else(gene %in% genes_to_highlight, gene, "")) %>% 
+                mutate(significant = case_when(p_val_adj < 0.05 & 
+                                               cluster == "b1" ~ "b1",
+                                               p_val_adj < 0.05 & cluster == "b2" ~ "b2",
+                                               TRUE ~ "Not differentially expressed")) %>% 
+                mutate(significant = if_else(gene%in%regional.genes, "regional.genes", significant)) %>%
+                mutate(log2FC = case_when(cluster == "b2" ~ avg_log2FC*-1,
+                                          TRUE ~ avg_log2FC)) %>% 
+                mutate(significant = if_else(gene%in%validated.genes, "Validated gene", significant)) %>%
+                mutate(priority = gene %in% genes_to_highlight) %>%
+                arrange(priority, gene) %>%
+                select(-priority) 
+                
+  volcano.data %>% 
+  ggplot(aes(log2FC, -log(base = 10, p_val_adj),  label = labs)) + 
+  geom_point(aes(col = significant), stroke = 0, size = 4, alpha = 0.5) + 
+  scale_color_manual(name = NULL, labels = c("Upregulated",
+                                             "Downregulated",
+                                             "Not differentially expressed",
+                                             "Regionalization-associated genes",
+                                             "Validated gene"
+                                             ), values = c("skyblue1", "mediumblue", "grey75","darkgreen","magenta")) +
+  geom_text_repel(max.overlaps = Inf, size=5, box.padding=0.3) +
+  theme_classic() +
+  theme(panel.grid.minor = element_blank(), 
+        text = element_text(family = "Helvetica", size = 15)
+        ) + 
+  labs(title = "Differential expression between B1 and B2 cells",
+       x = "Average log2FC",
+       y = "-log10 adjusted P value")
+  
+ggsave("data/btype_volcano.pdf", width = 6, height = 4)
+```
+#-Cell Cycle Score
+```{r}
+Head@active.assay <- 'SCT'
+s.genes <- cc.genes$s.genes %>% str_to_title()
+g2m.genes <- cc.genes$g2m.genes %>% str_to_title()
+
+Head <- CellCycleScoring(Head, s.features = s.genes, g2m.features = g2m.genes)
+
+mDimPlot(Head, group.by = 'Phase')
+```
+```{r}
+phaseplot1 <- Head@meta.data %>% 
+  filter(region == 'LW') %>% 
+  ggplot(aes(x = b_type, fill = Phase)) +
+  geom_bar(position = 'fill') +
+  theme_classic() + 
+  scale_y_continuous(name = 'Share', expand = c(0, 0), labels = scales::percent) +
+  scale_x_discrete(labels = c('B1', 'B2')) + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_fill_brewer(type = 'seq', palette = 8) + 
+  labs(x = NULL, y = 'Count')
+
+phaseplot2 <- Head@meta.data %>% 
+  filter(region == 'LW') %>%
+  ggplot(aes(x = age, fill = Phase)) +
+  geom_bar(position = 'fill') +
+  theme_classic() + 
+  scale_y_continuous(name = 'Share', expand = c(0, 0), labels = scales::percent) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_fill_brewer(type = 'seq', palette = 8) + 
+  labs(x = NULL, y = 'Count')
+
+phaseplot1 + phaseplot2 + plot_layout(guides = 'collect', axis_titles = 'collect_y') + plot_annotation(caption = 'Only cells in the LW region are shown.')
+ggsave("../figures/cell_cycle_phases.pdf", width = 5, height = 3)
+```
+
+
+# -B1 score 
+```{r}
+Head@active.assay <- "SCT"
+b.markers.list = list(b1 = c("Atf3", "Riiad1", "Foxj1", "Gadd45b", "Tagln2", "Emp1"))
+
+Head = AddModuleScore(Head, features = b.markers.list)
+Head@meta.data$B1_score <- NULL 
+Head@meta.data = Head@meta.data %>% dplyr::rename(B1_score = Cluster1)
+
+#Re-scaling Module Scores:These lines rescale the module scores (B1_score and B2_score) so that they have a mean of 0 and a standard deviation of 1. This step standardizes the scores, making them comparable across different modules.
+
+Head$B1_score = Head$B1_score %>% rescale() 
+
+mFeaturePlot(Head, features = "B1_score", order = T) & 
+  scale_color_distiller(type = 'seq', palette = 16, direction = 1)
+
+saveRDS(Head, "data/Head_withp365.rds")
+```
+
+```{r}
+mFeaturePlot(Head, features = c('Atf3', 'Tagln2', 'Emp1'), order = T, ncol = 3, legend = F)
+
+mFeaturePlot(HeadQ, 
+             features = b.markers.list$b1, 
+             split.by = 'b_type', 
+             order = T,
+             legend = F)
+
+DotPlot(HeadQ, b.markers.list$b1, group.by = 'b_type', scale = F )
+```
+
+```{r}
+Head@meta.data %>% filter(activation_state == 'quiescent') %>% 
+  ggplot(aes(x = age, y = B1_score, color = b_type)) +
+  geom_jitter(height = 0, alpha = 0.2, size = 0.5) +
+  geom_boxplot(outliers = F, fill = NA, size = 0.8) +
+  theme_classic() +
+  scale_y_continuous() +
+  scale_color_manual(name = 'B Type', 
+                     values = c('b1' = 'skyblue', 'b2' = 'mediumblue'), 
+                     labels = c('B1', 'B2')) + 
+  labs(title = 'B1 Score in quiescent B cells', x = 'Age', y = 'B1 Score') +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+
+ggsave('../figures/b1_scores_by_age.pdf', height = 3.5, width = 4.5)
+```  
+#-Heatmap
+
+## Colors
+```{r}
+#Main color
+col_values <- seq(-2, 2, 0.5)
+b1_score_values <- seq(0, 1, 0.125)
+col_fun <- colorRamp2(c(-2, 0, 2), c("cyan", "white", "magenta"))
+
+#annotations colors
+top_anno_colors <- list(Dissection = c("LV" = "grey90", "LW" = "purple", "Wedge" = "forestgreen"),
+                         `B Cell type` = c("b1" = 'skyblue1', "b2" = "mediumblue"),
+                        `B1 Score` = colorRamp2(b1_score_values, brewer.pal(n = length(b1_score_values), name = "YlGnBu")))
+```
+
+
+## Data
+```{r}
+set.seed(123)
+btype_markers$cluster <- btype_markers$cluster %>% fct_rev()
+
+heatmap_genes <- btype_markers %>%
+  group_by(cluster) %>%
+  top_n(100, dplyr::desc(p_val_adj)) %>%
+  arrange(cluster) %>%
+  pull(gene)
+
+heatmap_cells <- Head@meta.data %>% 
+  rownames_to_column('cell_barcode') %>%
+  group_by(b_type) %>%
+  sample_n(300) %>%
+  pull(cell_barcode)
+
+scaled_data <- Head@assays$SCT$scale.data %>% as.data.frame() 
+heatmap_data <- scaled_data[heatmap_genes, heatmap_cells] %>% drop_na()
+heatmap_metadata <- Head@meta.data[heatmap_cells,]
+
+
+top_anno <- HeatmapAnnotation(Dissection    = heatmap_metadata$region,
+                              `B Cell type` = heatmap_metadata$b_type,
+                              `B1 Score`    = heatmap_metadata$B1_score,
+                              col = top_anno_colors)
+
+
+
+genes_to_highlight <- c('Atf3', 'Riiad1', 'Foxj1', 'Gadd45b', 'Emp1', 'Tagln2', 'Anxa2', 'Ptprz1', 'Tox', 'Thbs4', 'Aldoc', 'Zeb1', 'Mgef8' )
+genes.index <- which(heatmap_genes %in% genes_to_highlight)
+left_anno <- anno_mark(at = genes.index, labels = heatmap_genes[genes.index], which = "row", side = 'left')
+
+
+
+hm <- rowAnnotation(right = left_anno) + 
+      Heatmap(heatmap_data, 
+              name = "Scaled Expression",
+              top_annotation = top_anno,
+              col = col_fun,
+              #column_split = heatmap_metadata$b_type,
+              column_order = heatmap_metadata %>% arrange(-B1_score) %>% rownames(),
+              cluster_column_slices = F,
+              border = T,
+              cluster_rows = F,
+              show_column_names = F,
+              show_row_names = T,
+              show_column_dend = F,
+              column_title = NULL,
+              show_row_dend = F,
+              row_names_side = 'left') 
+
+pdf("../figures/b1b2_degenes_heatmap.pdf", width = 8.2, height = 5.8)
+hm
+dev.off()
+```
