@@ -1,0 +1,460 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(clusterProfiler)
+
+source("../my_functions.R") #Loading a couple of custom functions for plotting
+```
+
+```{r}
+
+```
+
+
+```{r}
+#download files
+download.file("https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE193461&format=file&file=GSE193461%5Fbarcodes%2Etxt%2Egz", destfile = "external_data/carvajal/GSE193461_barcodes.txt.gz")
+download.file("https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE193461&format=file&file=GSE193461%5Fgenes%2Etxt%2Egz", destfile = "external_data/carvajal/GSE193461_genes.txt.gz")
+download.file("https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE193461&format=file&file=GSE193461%5Fhashtags%2Ecsv%2Egz", destfile = "external_data/carvajal/GSE193461_hashtags.txt.gz")
+download.file("https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE193461&format=file&file=GSE193461%5Fraw%5Fcounts%2Emtx%2Egz", destfile = "external_data/carvajal/GSE193461_raw_counts.mtx.gz")
+
+```
+
+
+```{r}
+library(Matrix)
+library(Matrix.utils)
+library(data.table)
+library(org.Mm.eg.db)
+
+mtx_file <- "/media/data5/marcos/b2/manuscript/3.label_transfer/external_data/carvajal/matrix.mtx.gz"
+barcodes_file <- "/media/data5/marcos/b2/manuscript/3.label_transfer/external_data/carvajal/barcodes.tsv.gz"
+genes_file <- "/media/data5/marcos/b2/manuscript/3.label_transfer/external_data/carvajal/features.tsv.gz"
+
+
+# Count Matrix and features.tsv from Carvajal et al uses ENSEMBL IDs. Let's convert them to gene symbols
+
+# Read features.tsv
+features <- read.delim(genes_file, header = FALSE, stringsAsFactors = FALSE)
+
+# Read the count matrix
+count_matrix <- readMM(mtx_file)
+
+# Remove version numbers
+features$V1 <- sub("\\..*", "", features$V1)
+
+
+# Map ENSEMBL IDs to gene symbols
+gene_mapping <- bitr(features$V1, fromType = "ENSEMBL", toType = "SYMBOL", OrgDb = org.Mm.eg.db)
+
+# Add row numbers to keep track of the original order
+features$row_num <- 1:nrow(features)
+
+# Merge features with gene mapping
+features_mapped <- merge(features, gene_mapping, by.x = "V1", by.y = "ENSEMBL")
+
+# Ensure the order is correct after merging
+features_mapped <- features_mapped[order(features_mapped$row_num), ]
+
+# Get the indices of rows to keep
+rows_to_keep <- features_mapped$row_num
+
+count_matrix <- count_matrix %>% t()
+
+# Subset the count matrix
+count_matrix_mapped <- count_matrix[rows_to_keep,]
+
+# Get the gene symbols in order
+gene_symbols <- features_mapped$SYMBOL
+
+# Aggregate the count matrix by gene symbol
+count_matrix_aggregated <- aggregate.Matrix(count_matrix_mapped, groupings = gene_symbols, fun = "sum")
+
+# Create a new features data frame with unique gene symbols
+new_features <- data.frame(SYMBOL = rownames(count_matrix_aggregated))
+
+# Save the new features.tsv
+write.table(
+  new_features,
+  file = "external_data/carvajal/new_features.tsv",
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+
+# Save the new count matrix
+writeMM(
+  count_matrix_aggregated,
+  file = "external_data/carvajal/new_matrix.mtx"
+)
+
+# Compress the file using system gzip command
+system("gzip -f external_data/carvajal/new_matrix.mtx")
+
+processed_genes_file <- "/media/data5/marcos/b2/manuscript/3.label_transfer/external_data/carvajal/new_features.tsv"
+new_mtx_file <- "/media/data5/marcos/b2/manuscript/3.label_transfer/external_data/carvajal/new_matrix.mtx.gz"
+```
+
+
+```{r}
+carvajal_mtx <- ReadMtx(mtx = new_mtx_file, 
+                        cells = barcodes_file,
+                        features = processed_genes_file, 
+                        feature.column = 1)
+
+metadata <- read_csv("/media/data5/marcos/b2/manuscript/3.label_transfer/external_data/carvajal/metadata.csv") %>% column_to_rownames('barcode')
+
+carvajal <- CreateSeuratObject(carvajal_mtx, meta.data = metadata)
+carvajal <- subset(carvajal, cells = rownames(metadata))
+
+carvajal@meta.data <- carvajal@meta.data %>% mutate(age = case_when(age == 'young' ~ 'p120',
+                                              age == 'old' ~ 'p500'))
+
+```
+
+
+```{r}
+carvajal <- carvajal %>% 
+            SCTransform(verbose = F) %>% 
+            RunPCA(npcs = 100, 
+                   verbose = F) %>% 
+            FindNeighbors(dims = 1:100, 
+                          verbose = F) %>% 
+            FindClusters(verbose = F) %>% 
+            RunUMAP(reduction = 'pca', 
+                    dims = 1:100, 
+                    verbose = F)
+```
+
+```{r}
+umap_reduc <- carvajal@reductions$umap
+umap_reduc@cell.embeddings[, 'umap_1'] <- carvajal$UMAP1 * -1
+umap_reduc@cell.embeddings[, 'umap_2'] <- carvajal$UMAP2
+
+carvajal@reductions$umap_original <- umap_reduc
+
+```
+
+
+```{r}
+mDimPlot(carvajal, label = T, group.by = c('celltype1', 'celltype2'), reduction = 'umap')
+mDimPlot(carvajal, label = T, group.by = c('celltype1', 'celltype2'), reduction = 'umap_original')
+mDimPlot(carvajal, label = F, group.by = c('age', 'genotype'), reduction = 'umap_original')
+
+
+```
+
+```{r}
+cells_to_keep <- carvajal@meta.data %>% filter(genotype == 'WT' & 
+                                               celltype1 == 'lineage') %>% rownames()
+
+carvajal_wt <- subset(carvajal, cells = cells_to_keep)
+carvajal_wt_all <- subset(carvajal, subset = genotype == 'WT')
+```
+
+```{r}
+carvajal_wt_all@meta.data <- carvajal_wt_all@meta.data %>% mutate(cell_type = case_when(celltype1 == 'lineage' ~ celltype2,
+                                                 TRUE ~ celltype1))
+```
+
+
+```{r}
+carvajal_wt$celltype2 <- factor(carvajal_wt$celltype2, levels = c('qNSC1', 'qNSC2', 'aNSC', 'TAP', 'NB'))
+
+mDimPlot(carvajal_wt, label = T, group.by = 'celltype2', reduction = 'umap_original') + scale_color_brewer(palette = 'Paired') 
+
+mDimPlot(carvajal_wt, label = T, group.by = 'celltype2', split.by = 'age', reduction = 'umap_original') + scale_color_brewer(palette = 'Paired') 
+
+carvajal_wt@active.assay <- "SCT"
+
+mFeaturePlot(carvajal_wt, features = c('S100b', 'S100a6', 'Egfr', 'Top2a', 'Dcx'), reduction = 'umap_original', order = T, ncol = 5, legend = F) 
+
+```
+
+```{r}
+carvajal_wt@meta.data %>% 
+  filter(celltype2 %in% c('qNSC2', 'aNSC')) %>% 
+  ggplot(aes(x = age, fill = fct_rev(celltype2))) +
+  geom_bar(position = 'fill') +
+  theme_classic() + 
+  scale_y_continuous(expand = c(0, 0), labels = scales::percent) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_fill_manual(values = c('#1c9099', '#a6bddb'), name = 'Activation State') +
+  labs(x = NULL, y = 'Share')
+
+ggsave("../figures/carvajal_activation_states.pdf", width = 3.2, height = 3)
+
+activation <- rbind(carvajal_wt@meta.data %>% 
+                      filter(celltype2 %in% c('qNSC2', 'aNSC')) %>% 
+                      mutate(activation_state = case_when(celltype2 == 'qNSC2' ~ 'quiescent',
+                                                          celltype2 == 'aNSC' ~ 'activated')) %>% 
+                      group_by(age, activation_state) %>% 
+                      summarize(n = n()) %>% 
+                      mutate(pct = n/sum(n)),
+                    Head@meta.data %>% 
+                      filter(region == 'LW') %>% 
+                      group_by(age, activation_state) %>% 
+                      summarize(n = n()) %>% 
+                      mutate(pct = n/sum(n))) %>% 
+mutate(age = as.integer(gsub("p", "", age)))
+
+activation %>% ggplot(aes(age, pct, col = activation_state)) + 
+  geom_line() + 
+  scale_x_continuous(limits = c(0, 500), breaks = sort(unique(activation$age))) + 
+  #scale_y_continuous(limits = c(0, 1)) +
+  theme_classic() + 
+  scale_color_manual(values = c('#1c9099', '#a6bddb'), name = 'Activation State') + 
+  labs(x = 'Age (days)', y = 'Share', caption = 'data at p30 and p365 from Cebrian-Silla et al, 2024.\n data at p120 and p500 from Carvajal Ibanez et al, 2023')
+ggsave("../figures/activation_states_timecourse.pdf", width = 5, height = 3)
+``` 
+
+
+#Label Transfer
+##B cells
+```{r}
+carvajal_wt <- carvajal_wt %>% 
+               SCTransform(verbose = F) %>% 
+               RunPCA(npcs = 50, 
+                      verbose = F)
+
+saveRDS(carvajal_wt, 'external_data/carvajal/carvajal_wt.rds')
+
+carvajal.anchors <- carvajal_wt %>% 
+                    FindTransferAnchors(normalization.method = 'SCT', 
+                                        query = Head, 
+                                        dims = 1:50,
+                                        reference.reduction = "pca")
+
+#Head2 uses RNA assay and logtransformation normalization. carvajal_wt_b is just B cells.
+
+Head@active.assay <- 'RNA'
+Head2 <- Head %>% NormalizeData() %>% FindVariableFeatures() %>%  ScaleData() %>% RunPCA(npcs = 50, verbose = F)
+
+carvajal_wt@active.assay <- 'RNA'
+carvajal_wt_b <- carvajal_wt %>% subset(subset = celltype2 %in% c('qNSC1', 'qNSC2', 'aNSC')) %>% 
+  NormalizeData() %>% 
+  FindVariableFeatures() %>%
+  ScaleData() %>% 
+  RunPCA(npcs = 50, verbose = F)
+
+
+cebrian.anchors <- Head2 %>% 
+                   FindTransferAnchors(query = carvajal_wt_b, 
+                                       dims = 1:50,
+                                       reference.reduction = "pca")
+
+predictions_from_carvajal <- TransferData(anchorset = carvajal.anchors, refdata = carvajal_wt$celltype2, dims = 1:50)
+predictions_from_cebrian <- TransferData(anchorset = cebrian.anchors, refdata = Head$b_type, dims = 1:50)
+```
+
+```{r}
+Head@meta.data <- Head@meta.data %>% 
+  rownames_to_column('barcode') %>% 
+  left_join(predictions_from_carvajal %>% 
+              rownames_to_column('barcode'), 
+            by = 'barcode') %>% column_to_rownames('barcode')
+
+carvajal_wt_b@meta.data <- carvajal_wt_b@meta.data %>% 
+  rownames_to_column('barcode') %>% 
+  left_join(predictions_from_cebrian %>% 
+              rownames_to_column('barcode'), 
+            by = 'barcode') %>% column_to_rownames('barcode')
+```
+
+```{r}
+mDimPlot(Head, label = F, group.by = c('bcell_subtype', 'b_type'), reduction = 'umap')
+mDimPlot(Head, label = T, group.by = 'predicted.id', reduction = 'umap', repel = T) + scale_color_brewer(palette = 'Paired', name = 'Predicted ID from \nCarvajal et al 2023')
+```
+
+```{r}
+b1.genes <- c("Atf3", "Riiad1", "Foxj1", "Gadd45b", "Tagln2", "Emp1")
+mDimPlot(carvajal_wt_b, label = F, group.by = c('celltype2', 'predicted.id', 'age'), reduction = 'umap_original', shuffle = T)
+mFeaturePlot(carvajal_wt_b, features = 'prediction.score.max', reduction = 'umap_original')
+mFeaturePlot(carvajal_wt_b, features = b1.genes, reduction = 'umap_original', legend = F, ncol = 3)
+mFeaturePlot(carvajal_wt_b, features = b1.genes, reduction = 'umap_original', legend = F, ncol = 3, order = T)
+mFeaturePlot(carvajal_wt_b, features = 'Dnah11', reduction = 'umap_original', legend = F, ncol = 3)
+```
+
+## All cells
+```{r}
+carvajal.anchors <- carvajal_wt_all %>% 
+                    FindTransferAnchors(normalization.method = 'SCT', 
+                                        query = integrated_exp, 
+                                        dims = 1:50,
+                                        reference.reduction = "pca")
+
+predictions_from_carvajal <- TransferData(anchorset = carvajal.anchors, refdata = carvajal_wt_all$celltype, dims = 1:50)
+
+integrated_exp@meta.data <- integrated_exp@meta.data %>% 
+  rownames_to_column('barcode') %>% 
+  left_join(predictions_from_carvajal %>% 
+              rownames_to_column('barcode'), 
+            by = 'barcode') %>% column_to_rownames('barcode')
+```
+
+```{r}
+mDimPlot(integrated_exp, label = T, group.by = c('cell_type', 'predicted.id'), reduction = 'umap')
+```
+
+
+#B1 score in carvajal
+```{r}
+carvajal_wt_b@active.assay <- "SCT"
+b.markers.list = list(b1 = c("Atf3", "Riiad1", "Foxj1", "Gadd45b", "Tagln2", "Emp1"))
+
+carvajal_wt_b = AddModuleScore(carvajal_wt_b, features = b.markers.list)
+carvajal_wt_b@meta.data  = carvajal_wt_b@meta.data %>% dplyr::rename(B1_score = Cluster1)
+
+#Re-scaling Module Scores:These lines rescale the module scores (B1_score and B2_score) so that they have a mean of 0 and a standard deviation of 1. This step standardizes the scores, making them comparable across different modules.
+
+carvajal_wt_b$B1_score = carvajal_wt_b$B1_score %>% rescale() 
+
+FeaturePlot(carvajal_wt_b, c("B1_score"), order = T, pt.size = 1.5) & 
+  scale_color_viridis(option = "magma") & 
+  NoAxes() & 
+  coord_fixed()
+
+carvajal_wt_b@meta.data %>% filter(celltype2 == 'qNSC2') %>% ggplot(aes(x = age, y = B1_score)) +
+  geom_boxplot(outliers = F) +
+  geom_jitter(height = 0, alpha = 0.2) +
+  theme_classic() +
+  scale_y_continuous() +
+  labs(title = 'B1 Score in qNSC2 cluster', x = 'Age', y = 'B1 Score') +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+```
+
+```{r}
+mDimPlot(Head, label = F, group.by = 'b_type', reduction = 'umap')
+mDimPlot(Head, label = F, group.by = 'activation_state',  reduction = 'umap') + scale_color_manual(values = c('#1c9099', '#a6bddb'), name = 'Activation State')
+```
+
+
+```{r fig.width=10, fig.height=3}
+a <- Head@meta.data %>% ggplot(aes(x = b_type, fill = activation_state)) +
+  geom_bar() +
+  theme_classic() + 
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_x_discrete(labels = c('TdTomato+', 'TdTomato+ NN', 'TdTomato-')) + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_fill_manual(values = c('#1c9099', '#a6bddb'), name = 'Activation State') +
+  labs(x = NULL, y = 'Count')
+
+b <- Head@meta.data %>% ggplot(aes(x = b_type, fill = activation_state)) +
+  geom_bar(position = 'fill') +
+  theme_classic() + 
+  scale_y_continuous(expand = c(0, 0), labels = scales::percent) +
+  scale_x_discrete(labels = c('TdTomato+', 'TdTomato+ NN', 'TdTomato-')) + 
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) + 
+  scale_fill_manual(values = c('#1c9099', '#a6bddb'), name = 'Activation State') +
+  labs(x = NULL, y = 'Share')
+
+a + b + plot_layout(guides = 'collect') 
+```
+
+
+```{r fig.width=10, fig.height=3}
+Head$predicted.id <- factor(Head$predicted.id, levels = c('qNSC1', 'qNSC2', 'aNSC', 'TAP', 'NB'))
+
+a <- Head@meta.data %>% ggplot(aes(x = b_type, fill = predicted.id)) +
+  geom_bar() +
+  theme_classic() + 
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_brewer(palette = 'Paired', name = 'Predicted ID from \nCarvajal et al 2023') +
+  labs(x = NULL, y = 'Count')
+
+b <- Head@meta.data %>% ggplot(aes(x = b_type, fill = predicted.id)) +
+  geom_bar(position = 'fill') +
+  theme_classic() + 
+  scale_y_continuous(expand = c(0, 0), labels = scales::percent) +
+  scale_fill_brewer(palette = 'Paired', name = 'Predicted ID from \nCarvajal et al 2023') +
+  labs(x = NULL, y = 'Share')
+
+a + b + plot_layout(guides = 'collect') 
+ggsave('../figures/label_transfer_barplot.pdf',  width = 5, height = 3)
+```
+
+
+# Sankey chart
+```{r}
+# Libraries
+library(ggalluvial)
+
+# Count the number of cells for each combination of b_type, cell_subtype, and predicted.id
+sankey_data <- integrated_exp@meta.data %>%
+  mutate(predicted.id = gsub("lineage:", "", predicted.id)) %>% 
+  group_by(cell_type, predicted.id) %>%
+  summarise(n = n(), .groups = 'drop') %>% filter(n > 50)
+
+sankey_data$cell_type
+
+# Create the Sankey plot
+ggplot(sankey_data %>% filter(cell_type %in% c('A cells', 'B cells', 'C cells', 'Dividing cells', 'Astrocytes')),
+       aes(axis1 = cell_type, 
+           axis2 = predicted.id, 
+           y = n,
+           fill = cell_type)) +
+  geom_alluvium(alpha = 0.8) +
+  geom_stratum() +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum))) +
+  scale_x_discrete(limits = c("Cell Type", "Predicted ID from\nCarvajal et al. 2023"), expand = c(0.15, 0.05)) +
+  theme_minimal() +
+  theme(panel.grid = element_blank()) + 
+  scale_fill_manual(name = 'Cell Type', values = c('A cells' = 'tomato', 'B cells' = 'dodgerblue', 'Dividing cells' = 'gold', 'C cells' = 'forestgreen', 'Astrocytes' = 'orange'), na.value = 'grey90') +
+  ggtitle("Cell Types and Predicted IDs from Carvajal et al. 2023") 
+ggsave('../figures/label_transfer_sankeyplot.pdf')
+```
+
+# Correlation plots
+
+```{r}
+# Find common genes
+common_genes <- intersect(integrated_exp@assays$SCT@var.features, carvajal_wt_all@assays$SCT@var.features)
+
+# For Dataset 1
+integrated_celltype_avg_exp <- AverageExpression(integrated_exp, 
+                                          return.seurat = FALSE,
+                                          group.by = 'cell_type',
+                                          features = common_genes)$SCT %>% as.matrix()
+
+# For Dataset 2
+carvajal_celltype_avg_exp <- AverageExpression(carvajal_wt_all, 
+                                                  return.seurat = FALSE, 
+                                                  group.by = 'celltype', 
+                                                  features = common_genes)$SCT %>% as.matrix()
+```
+
+
+```{r}
+# Compute the correlation matrix
+correlation_matrix <- cor(integrated_celltype_avg_exp, carvajal_celltype_avg_exp, method = "spearman")
+colnames(correlation_matrix) <- gsub('_lineage', '', colnames(correlation_matrix))
+```
+```{r}
+library(pheatmap)
+
+# Plot the heatmap
+cormatrix <- pheatmap(correlation_matrix, 
+                      cluster_rows = T,
+                      cluster_cols = T,
+                      treeheight_row = 0,
+                      treeheight_col = 0,
+                      main = "Correlation Matrix of Clusters Between Datasets",
+                      angle_col = 45, 
+                      display_numbers = T,
+                      fontsize_number = 6,
+                      border_color = "black",
+                      number_color = "black")
+
+pdf('../figures/correlationmatrix.pdf', width = 6, height = 5)
+cormatrix
+dev.off()
+```
+
+
+
